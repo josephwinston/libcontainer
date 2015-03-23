@@ -9,16 +9,36 @@ import (
 	"strings"
 
 	"github.com/docker/libcontainer/cgroups"
+	"github.com/docker/libcontainer/configs"
 )
 
 type BlkioGroup struct {
 }
 
-func (s *BlkioGroup) Set(d *data) error {
-	// we just want to join this group even though we don't set anything
-	if _, err := d.join("blkio"); err != nil && err != cgroups.ErrNotFound {
+func (s *BlkioGroup) Apply(d *data) error {
+	dir, err := d.join("blkio")
+	if err != nil {
+		if cgroups.IsNotFound(err) {
+			return nil
+		} else {
+			return err
+		}
+	}
+
+	if err := s.Set(dir, d.c); err != nil {
 		return err
 	}
+
+	return nil
+}
+
+func (s *BlkioGroup) Set(path string, cgroup *configs.Cgroup) error {
+	if cgroup.BlkioWeight != 0 {
+		if err := writeFile(path, "blkio.weight", strconv.FormatInt(cgroup.BlkioWeight, 10)); err != nil {
+			return err
+		}
+	}
+
 	return nil
 }
 
@@ -114,6 +134,14 @@ func getBlkioStat(path string) ([]cgroups.BlkioStatEntry, error) {
 }
 
 func (s *BlkioGroup) GetStats(path string, stats *cgroups.Stats) error {
+	// Try to read CFQ stats available on all CFQ enabled kernels first
+	if blkioStats, err := getBlkioStat(filepath.Join(path, "blkio.io_serviced_recursive")); err == nil && blkioStats != nil {
+		return getCFQStats(path, stats)
+	}
+	return getStats(path, stats) // Use generic stats as fallback
+}
+
+func getCFQStats(path string, stats *cgroups.Stats) error {
 	var blkioStats []cgroups.BlkioStatEntry
 	var err error
 
@@ -136,6 +164,43 @@ func (s *BlkioGroup) GetStats(path string, stats *cgroups.Stats) error {
 		return err
 	}
 	stats.BlkioStats.IoQueuedRecursive = blkioStats
+
+	if blkioStats, err = getBlkioStat(filepath.Join(path, "blkio.io_service_time_recursive")); err != nil {
+		return err
+	}
+	stats.BlkioStats.IoServiceTimeRecursive = blkioStats
+
+	if blkioStats, err = getBlkioStat(filepath.Join(path, "blkio.io_wait_time_recursive")); err != nil {
+		return err
+	}
+	stats.BlkioStats.IoWaitTimeRecursive = blkioStats
+
+	if blkioStats, err = getBlkioStat(filepath.Join(path, "blkio.io_merged_recursive")); err != nil {
+		return err
+	}
+	stats.BlkioStats.IoMergedRecursive = blkioStats
+
+	if blkioStats, err = getBlkioStat(filepath.Join(path, "blkio.time_recursive")); err != nil {
+		return err
+	}
+	stats.BlkioStats.IoTimeRecursive = blkioStats
+
+	return nil
+}
+
+func getStats(path string, stats *cgroups.Stats) error {
+	var blkioStats []cgroups.BlkioStatEntry
+	var err error
+
+	if blkioStats, err = getBlkioStat(filepath.Join(path, "blkio.throttle.io_service_bytes")); err != nil {
+		return err
+	}
+	stats.BlkioStats.IoServiceBytesRecursive = blkioStats
+
+	if blkioStats, err = getBlkioStat(filepath.Join(path, "blkio.throttle.io_serviced")); err != nil {
+		return err
+	}
+	stats.BlkioStats.IoServicedRecursive = blkioStats
 
 	return nil
 }

@@ -1,46 +1,59 @@
-package nsinit
+package main
 
 import (
 	"encoding/json"
-	"log"
+	"fmt"
 	"os"
-	"path/filepath"
 
+	"github.com/codegangsta/cli"
 	"github.com/docker/libcontainer"
+	"github.com/docker/libcontainer/configs"
 )
 
-func loadContainer() (*libcontainer.Config, error) {
-	f, err := os.Open(filepath.Join(dataPath, "container.json"))
+func loadConfig(context *cli.Context) (*configs.Config, error) {
+	if path := context.String("config"); path != "" {
+		f, err := os.Open(path)
+		if err != nil {
+			return nil, err
+		}
+		defer f.Close()
+		var config *configs.Config
+		if err := json.NewDecoder(f).Decode(&config); err != nil {
+			return nil, err
+		}
+		return config, nil
+	}
+	config := getTemplate()
+	modify(config, context)
+	return config, nil
+}
+
+func loadFactory(context *cli.Context) (libcontainer.Factory, error) {
+	return libcontainer.New(context.GlobalString("root"), libcontainer.Cgroupfs)
+}
+
+func getContainer(context *cli.Context) (libcontainer.Container, error) {
+	factory, err := loadFactory(context)
 	if err != nil {
 		return nil, err
 	}
-	defer f.Close()
-
-	var container *libcontainer.Config
-	if err := json.NewDecoder(f).Decode(&container); err != nil {
-		return nil, err
-	}
-
-	return container, nil
-}
-
-func openLog(name string) error {
-	f, err := os.OpenFile(name, os.O_CREATE|os.O_RDWR|os.O_APPEND, 0755)
+	container, err := factory.Load(context.String("id"))
 	if err != nil {
-		return err
-	}
-
-	log.SetOutput(f)
-
-	return nil
-}
-
-func loadContainerFromJson(rawData string) (*libcontainer.Config, error) {
-	var container *libcontainer.Config
-
-	if err := json.Unmarshal([]byte(rawData), &container); err != nil {
 		return nil, err
 	}
-
 	return container, nil
+}
+
+func fatal(err error) {
+	if lerr, ok := err.(libcontainer.Error); ok {
+		lerr.Detail(os.Stderr)
+		os.Exit(1)
+	}
+	fmt.Fprintln(os.Stderr, err)
+	os.Exit(1)
+}
+
+func fatalf(t string, v ...interface{}) {
+	fmt.Fprintf(os.Stderr, t, v...)
+	os.Exit(1)
 }

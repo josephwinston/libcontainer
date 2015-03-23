@@ -4,10 +4,12 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/docker/docker/pkg/mount"
 )
@@ -28,7 +30,23 @@ func FindCgroupMountpoint(subsystem string) (string, error) {
 			}
 		}
 	}
-	return "", ErrNotFound
+
+	return "", NewNotFoundError(subsystem)
+}
+
+func FindCgroupMountpointDir() (string, error) {
+	mounts, err := mount.GetMounts()
+	if err != nil {
+		return "", err
+	}
+
+	for _, mount := range mounts {
+		if mount.Fstype == "cgroup" {
+			return filepath.Dir(mount.Mountpoint), nil
+		}
+	}
+
+	return "", NewNotFoundError("cgroup")
 }
 
 type Mount struct {
@@ -113,7 +131,7 @@ func GetThisCgroupDir(subsystem string) (string, error) {
 	}
 	defer f.Close()
 
-	return parseCgroupFile(subsystem, f)
+	return ParseCgroupFile(subsystem, f)
 }
 
 func GetInitCgroupDir(subsystem string) (string, error) {
@@ -123,7 +141,7 @@ func GetInitCgroupDir(subsystem string) (string, error) {
 	}
 	defer f.Close()
 
-	return parseCgroupFile(subsystem, f)
+	return ParseCgroupFile(subsystem, f)
 }
 
 func ReadProcsFile(dir string) ([]int, error) {
@@ -150,19 +168,71 @@ func ReadProcsFile(dir string) ([]int, error) {
 	return out, nil
 }
 
-func parseCgroupFile(subsystem string, r io.Reader) (string, error) {
+func ParseCgroupFile(subsystem string, r io.Reader) (string, error) {
 	s := bufio.NewScanner(r)
+
 	for s.Scan() {
 		if err := s.Err(); err != nil {
 			return "", err
 		}
+
 		text := s.Text()
 		parts := strings.Split(text, ":")
+
 		for _, subs := range strings.Split(parts[1], ",") {
 			if subs == subsystem {
 				return parts[2], nil
 			}
 		}
 	}
-	return "", ErrNotFound
+
+	return "", NewNotFoundError(subsystem)
+}
+
+func PathExists(path string) bool {
+	if _, err := os.Stat(path); err != nil {
+		return false
+	}
+	return true
+}
+
+func EnterPid(cgroupPaths map[string]string, pid int) error {
+	for _, path := range cgroupPaths {
+		if PathExists(path) {
+			if err := ioutil.WriteFile(filepath.Join(path, "cgroup.procs"),
+				[]byte(strconv.Itoa(pid)), 0700); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// RemovePaths iterates over the provided paths removing them.
+// We trying to remove all paths five times with increasing delay between tries.
+// If after all there are not removed cgroups - appropriate error will be
+// returned.
+func RemovePaths(paths map[string]string) (err error) {
+	delay := 10 * time.Millisecond
+	for i := 0; i < 5; i++ {
+		if i != 0 {
+			time.Sleep(delay)
+			delay *= 2
+		}
+		for s, p := range paths {
+			os.RemoveAll(p)
+			// TODO: here probably should be logging
+			_, err := os.Stat(p)
+			// We need this strange way of checking cgroups existence because
+			// RemoveAll almost always returns error, even on already removed
+			// cgroups
+			if os.IsNotExist(err) {
+				delete(paths, s)
+			}
+		}
+		if len(paths) == 0 {
+			return nil
+		}
+	}
+	return fmt.Errorf("Failed to remove paths: %s", paths)
 }

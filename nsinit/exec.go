@@ -1,186 +1,116 @@
-package nsinit
+package main
 
 import (
-	"fmt"
-	"io"
-	"log"
 	"os"
 	"os/exec"
 	"os/signal"
 	"syscall"
 
 	"github.com/codegangsta/cli"
-	"github.com/docker/docker/pkg/term"
 	"github.com/docker/libcontainer"
-	consolepkg "github.com/docker/libcontainer/console"
-	"github.com/docker/libcontainer/namespaces"
+	"github.com/docker/libcontainer/utils"
 )
+
+var standardEnvironment = &cli.StringSlice{
+	"PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+	"HOSTNAME=nsinit",
+	"TERM=xterm",
+}
 
 var execCommand = cli.Command{
 	Name:   "exec",
 	Usage:  "execute a new command inside a container",
 	Action: execAction,
+	Flags: append([]cli.Flag{
+		cli.BoolFlag{Name: "tty,t", Usage: "allocate a TTY to the container"},
+		cli.StringFlag{Name: "id", Value: "nsinit", Usage: "specify the ID for a container"},
+		cli.StringFlag{Name: "config", Value: "", Usage: "path to the configuration file"},
+		cli.StringFlag{Name: "user,u", Value: "root", Usage: "set the user, uid, and/or gid for the process"},
+		cli.StringFlag{Name: "cwd", Value: "", Usage: "set the current working dir"},
+		cli.StringSliceFlag{Name: "env", Value: standardEnvironment, Usage: "set environment variables for the process"},
+	}, createFlags...),
 }
 
 func execAction(context *cli.Context) {
-	var exitCode int
-
-	container, err := loadContainer()
+	factory, err := loadFactory(context)
 	if err != nil {
-		log.Fatal(err)
+		fatal(err)
 	}
-
-	state, err := libcontainer.GetState(dataPath)
-	if err != nil && !os.IsNotExist(err) {
-		log.Fatalf("unable to read state.json: %s", err)
-	}
-
-	if state != nil {
-		exitCode, err = runIn(container, state, []string(context.Args()))
-	} else {
-		exitCode, err = startContainer(container, dataPath, []string(context.Args()))
-	}
-
+	config, err := loadConfig(context)
 	if err != nil {
-		log.Fatalf("failed to exec: %s", err)
+		fatal(err)
+	}
+	created := false
+	container, err := factory.Load(context.String("id"))
+	if err != nil {
+		created = true
+		if container, err = factory.Create(context.String("id"), config); err != nil {
+			fatal(err)
+		}
+	}
+	process := &libcontainer.Process{
+		Args:   context.Args(),
+		Env:    context.StringSlice("env"),
+		User:   context.String("user"),
+		Cwd:    context.String("cwd"),
+		Stdin:  os.Stdin,
+		Stdout: os.Stdout,
+		Stderr: os.Stderr,
+	}
+	rootuid, err := config.HostUID()
+	if err != nil {
+		fatal(err)
+	}
+	tty, err := newTty(context, process, rootuid)
+	if err != nil {
+		fatal(err)
+	}
+	if err := tty.attach(process); err != nil {
+		fatal(err)
+	}
+	go handleSignals(process, tty)
+	err = container.Start(process)
+	if err != nil {
+		tty.Close()
+		if created {
+			container.Destroy()
+		}
+		fatal(err)
 	}
 
-	os.Exit(exitCode)
-}
-
-func runIn(container *libcontainer.Config, state *libcontainer.State, args []string) (int, error) {
-	var (
-		master  *os.File
-		console string
-		err     error
-
-		stdin  = os.Stdin
-		stdout = os.Stdout
-		stderr = os.Stderr
-		sigc   = make(chan os.Signal, 10)
-	)
-
-	signal.Notify(sigc)
-
-	if container.Tty {
-		stdin = nil
-		stdout = nil
-		stderr = nil
-
-		master, console, err = consolepkg.CreateMasterAndConsole()
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		go io.Copy(master, os.Stdin)
-		go io.Copy(os.Stdout, master)
-
-		state, err := term.SetRawTerminal(os.Stdin.Fd())
-		if err != nil {
-			log.Fatal(err)
-		}
-
-		defer term.RestoreTerminal(os.Stdin.Fd(), state)
-	}
-
-	startCallback := func(cmd *exec.Cmd) {
-		go func() {
-			resizeTty(master)
-
-			for sig := range sigc {
-				switch sig {
-				case syscall.SIGWINCH:
-					resizeTty(master)
-				default:
-					cmd.Process.Signal(sig)
-				}
+	status, err := process.Wait()
+	if err != nil {
+		exitError, ok := err.(*exec.ExitError)
+		if ok {
+			status = exitError.ProcessState
+		} else {
+			tty.Close()
+			if created {
+				container.Destroy()
 			}
-		}()
+			fatal(err)
+		}
 	}
-
-	return namespaces.RunIn(container, state, args, os.Args[0], stdin, stdout, stderr, console, startCallback)
+	if created {
+		if err := container.Destroy(); err != nil {
+			tty.Close()
+			fatal(err)
+		}
+	}
+	tty.Close()
+	os.Exit(utils.ExitStatus(status.Sys().(syscall.WaitStatus)))
 }
 
-// startContainer starts the container. Returns the exit status or -1 and an
-// error.
-//
-// Signals sent to the current process will be forwarded to container.
-func startContainer(container *libcontainer.Config, dataPath string, args []string) (int, error) {
-	var (
-		cmd  *exec.Cmd
-		sigc = make(chan os.Signal, 10)
-	)
-
+func handleSignals(container *libcontainer.Process, tty *tty) {
+	sigc := make(chan os.Signal, 10)
 	signal.Notify(sigc)
-
-	createCommand := func(container *libcontainer.Config, console, rootfs, dataPath, init string, pipe *os.File, args []string) *exec.Cmd {
-		cmd = namespaces.DefaultCreateCommand(container, console, rootfs, dataPath, init, pipe, args)
-		if logPath != "" {
-			cmd.Env = append(cmd.Env, fmt.Sprintf("log=%s", logPath))
+	tty.resize()
+	for sig := range sigc {
+		switch sig {
+		case syscall.SIGWINCH:
+			tty.resize()
+		default:
+			container.Signal(sig)
 		}
-		return cmd
-	}
-
-	var (
-		master  *os.File
-		console string
-		err     error
-
-		stdin  = os.Stdin
-		stdout = os.Stdout
-		stderr = os.Stderr
-	)
-
-	if container.Tty {
-		stdin = nil
-		stdout = nil
-		stderr = nil
-
-		master, console, err = consolepkg.CreateMasterAndConsole()
-		if err != nil {
-			return -1, err
-		}
-
-		go io.Copy(master, os.Stdin)
-		go io.Copy(os.Stdout, master)
-
-		state, err := term.SetRawTerminal(os.Stdin.Fd())
-		if err != nil {
-			return -1, err
-		}
-
-		defer term.RestoreTerminal(os.Stdin.Fd(), state)
-	}
-
-	startCallback := func() {
-		go func() {
-			resizeTty(master)
-
-			for sig := range sigc {
-				switch sig {
-				case syscall.SIGWINCH:
-					resizeTty(master)
-				default:
-					cmd.Process.Signal(sig)
-				}
-			}
-		}()
-	}
-
-	return namespaces.Exec(container, stdin, stdout, stderr, console, "", dataPath, args, createCommand, startCallback)
-}
-
-func resizeTty(master *os.File) {
-	if master == nil {
-		return
-	}
-
-	ws, err := term.GetWinsize(os.Stdin.Fd())
-	if err != nil {
-		return
-	}
-
-	if err := term.SetWinsize(master.Fd(), ws); err != nil {
-		return
 	}
 }
